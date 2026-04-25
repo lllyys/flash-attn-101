@@ -42,8 +42,8 @@ int main()
         >
     > attention_launchers = {
         {"cuda core flash attention 01", launch_flash_attention_01<__half>},
-        {"cuda core flash attention 02", launch_flash_attention_02<__half>},
-        {"cute flash attention 02", mha_fwd<__half>},
+        // {"cuda core flash attention 02", launch_flash_attention_02<__half>},  // disabled: cutlass dependency
+        // {"cute flash attention 02", mha_fwd<__half>},                        // disabled: cutlass dependency
     };
 
     for (const auto& [name, attention_launcher] : attention_launchers) {

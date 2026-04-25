@@ -2,13 +2,13 @@
  * naive_attention.cu — CUDA implementation of Naive Causal Self-Attention.
  *
  * Formula:  O = softmax(causal_mask(Q @ K^T / sqrt(d))) @ V
- * Input:    Q, K, V, shape [B, H, S, D], fp32
- * Output:   O, shape [B, H, S, D], fp32
+ * Input:    Q, K, V, shape [B, H, S, D], half (fp16)
+ * Output:   O, shape [B, H, S, D], half (fp16)
  *
  * 3 kernels: naive_gemm (QK^T + scale + mask) -> naive_softmax -> naive_pv (P @ V)
  * Grid: B*H blocks, S threads per block (one thread per row).
  *
- * Mirrored from flash-attn-101/csrc/naive_attention.cu (fp16 template -> fp32 direct).
+ * Kernel code identical to csrc/naive_attention.cu.
  * Structure matches ascendc/naive_attention.asc for side-by-side comparison.
  */
 
@@ -19,6 +19,9 @@
 #include <iostream>
 #include <random>
 #include <vector>
+#include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <cuda_fp16.h>
 
 // ============================================================================
 // Config
@@ -37,163 +40,183 @@ constexpr int PERF_S = 256;
 constexpr int PERF_D = 64;
 
 // ============================================================================
-// Kernel 1: naive_gemm — S = scale * (Q @ K^T) + causal mask
+// Kernel 1: naive_gemm — identical to csrc/naive_attention.cu
 // ============================================================================
 
+// gemm: aA@B + bC, A (m, k), B(n, k), C(m, n)
+// m: seq_len, n: seq_len, k: head_dim
+template <typename T>
 __global__ void naive_gemm(
-    const float* Q,
-    const float* K,
-    float* S,
-    float scale,
-    int seq_len,
-    int head_dim)
+    const T* A,
+    const T* B,
+    T* C,
+    T a,
+    T b,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+)
 {
-    int qkv_offset = blockIdx.x * (seq_len * head_dim);
-    int s_offset   = blockIdx.x * (seq_len * seq_len);
-    int row = threadIdx.x;
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-    for (int col = 0; col < seq_len; col++) {
-        if (col > row) {
-            S[s_offset + row * seq_len + col] = -INFINITY;
-        } else {
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) {
-                dot += Q[qkv_offset + row * head_dim + d]
-                     * K[qkv_offset + col * head_dim + d];
+    for (int j = 0; j < N; j++) {
+        if (j > threadIdx.x) {
+            C[idx * N + j] = -INFINITY;
+        }
+        else {
+            T sum = static_cast<T>(0.f);
+            for (int k = 0; k < K; k++) {
+                sum += A[idx * K + k] * B[(blockDim.x * blockIdx.x + j) * K + k];
             }
-            S[s_offset + row * seq_len + col] = scale * dot;
+            C[idx * N + j] = a * sum + b * C[idx * N + j];
         }
     }
 }
 
 // ============================================================================
-// Kernel 2: naive_softmax — 3-pass row-wise softmax
+// Kernel 2: naive_softmax — identical to csrc/naive_attention.cu
 // ============================================================================
 
+// softmax: exp(x - max(x)) / sum(exp(x - max(x)))
+template <typename T>
 __global__ void naive_softmax(
-    float* input,
-    float* output,
-    int seq_len)
+    T* input,
+    T* output,
+    unsigned int N
+)
 {
-    int offset = blockIdx.x * (seq_len * seq_len);
-    int row = threadIdx.x;
+    // 3-pass softmax
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-    // Pass 1: row max
-    float row_max = -INFINITY;
-    for (int j = 0; j < seq_len; j++) {
-        float val = input[offset + row * seq_len + j];
-        if (val > row_max) row_max = val;
+    T row_max = -INFINITY;
+    T sum = static_cast<T>(0.f);
+
+    // max
+    for (int j = 0; j < N; j++) {
+        row_max = row_max > input[idx * N + j] ? row_max : input[idx * N + j];
     }
 
-    // Pass 2: exp(x - max) and sum
-    float sum = 0.0f;
-    for (int j = 0; j < seq_len; j++) {
-        if (j > row) {
-            output[offset + row * seq_len + j] = 0.0f;
-        } else {
-            output[offset + row * seq_len + j] = __expf(input[offset + row * seq_len + j] - row_max);
+    // sum
+    for (int j = 0; j < N; j++) {
+        if (j > threadIdx.x) {
+            output[idx * N + j] = static_cast<T>(0.f);
         }
-        sum += output[offset + row * seq_len + j];
+        else {
+        output[idx * N + j] = __expf(input[idx * N + j] - row_max);
+        }
+        sum += output[idx * N + j];
+        // sum += exp(input[i] - row_max); is not correct because input[i] is also output[i]
     }
 
-    // Pass 3: normalize
-    for (int j = 0; j < seq_len; j++) {
-        output[offset + row * seq_len + j] /= sum;
+    // softmax
+    for (int j = 0; j < N; j++) {
+        output[idx * N + j] /= sum;
     }
 }
 
 // ============================================================================
-// Kernel 3: naive_pv — O = P @ V
+// Kernel 3: naive_pv — identical to csrc/naive_attention.cu
 // ============================================================================
 
+// QK[M, M] @ V[M, N]
+template <typename T>
 __global__ void naive_pv(
-    const float* P,
-    const float* V,
-    float* O,
-    int seq_len,
-    int head_dim)
+    const T *P,
+    const T *V,
+    T *O,
+    unsigned int M, unsigned int N
+)
 {
-    int p_offset   = blockIdx.x * (seq_len * seq_len);
-    int qkv_offset = blockIdx.x * (seq_len * head_dim);
-    int row = threadIdx.x;
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-    for (int d = 0; d < head_dim; d++) {
-        float acc = 0.0f;
-        for (int j = 0; j < seq_len; j++) {
-            acc += P[p_offset + row * seq_len + j]
-                 * V[qkv_offset + j * head_dim + d];
+    for (int j = 0; j < N; j++) {
+        T sum = static_cast<T>(0.f);
+        for (int m = 0; m < M; m++) {
+            sum += P[idx * M + m] * V[(blockDim.x * blockIdx.x + m) * N + j];
         }
-        O[qkv_offset + row * head_dim + d] = acc;
+        O[idx * N + j] = sum;
     }
 }
 
 // ============================================================================
-// Host wrapper
+// Host wrapper — uses half, matches csrc/naive_attention.cu launch pattern
 // ============================================================================
 
 std::vector<float> naive_attention(
-    const std::vector<float>& h_Q,
-    const std::vector<float>& h_K,
-    const std::vector<float>& h_V,
+    const std::vector<float>& h_Q_f,
+    const std::vector<float>& h_K_f,
+    const std::vector<float>& h_V_f,
     int B, int H, int S, int D,
     cudaStream_t stream)
 {
-    float scale = 1.0f / sqrtf((float)D);
+    half sm_scale = __float2half(1.0f / sqrtf((float)D));
 
-    const size_t qkv_bytes  = (size_t)B * H * S * D * sizeof(float);
-    const size_t attn_bytes = (size_t)B * H * S * S * sizeof(float);
-    const size_t out_elems  = (size_t)B * H * S * D;
+    const size_t num_elems   = (size_t)B * H * S * D;
+    const size_t qkv_bytes   = num_elems * sizeof(half);
+    const size_t attn_elems  = (size_t)B * H * S * S;
+
+    // Convert float input to half on host
+    std::vector<half> h_Q(num_elems), h_K(num_elems), h_V(num_elems);
+    for (size_t i = 0; i < num_elems; i++) {
+        h_Q[i] = __float2half(h_Q_f[i]);
+        h_K[i] = __float2half(h_K_f[i]);
+        h_V[i] = __float2half(h_V_f[i]);
+    }
 
     // Allocate device memory
-    float *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
-    float *d_attn = nullptr;
-    cudaMalloc((void**)&d_Q,    qkv_bytes);
-    cudaMalloc((void**)&d_K,    qkv_bytes);
-    cudaMalloc((void**)&d_V,    qkv_bytes);
-    cudaMalloc((void**)&d_O,    qkv_bytes);
-    cudaMalloc((void**)&d_attn, attn_bytes);
+    half *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
+    cudaMalloc((void**)&d_Q, qkv_bytes);
+    cudaMalloc((void**)&d_K, qkv_bytes);
+    cudaMalloc((void**)&d_V, qkv_bytes);
+    cudaMalloc((void**)&d_O, qkv_bytes);
+
+    // sm allocation (thrust::device_vector, matches original)
+    thrust::device_vector<half> d_sm(attn_elems);
+    half* d_sm_ptr = d_sm.data().get();
 
     // H2D
     cudaMemcpy(d_Q, h_Q.data(), qkv_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_K, h_K.data(), qkv_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), qkv_bytes, cudaMemcpyHostToDevice);
 
-    // Grid/Block
-    uint32_t grid  = B * H;
-    uint32_t block = S;
-
-    // Kernel 1: QK^T + scale + causal mask
-    naive_gemm<<<grid, block, 0, stream>>>(d_Q, d_K, d_attn, scale, S, D);
+    // sm = QK^T
+    dim3 qk_grid(B * H, 1, 1);
+    dim3 qk_block(S, 1, 1);
+    naive_gemm<half><<<qk_grid, qk_block, 0, stream>>>(d_Q, d_K, d_sm_ptr, sm_scale, __float2half(0.f), S, S, D);
     cudaStreamSynchronize(stream);
 
-    // Kernel 2: softmax (in-place)
-    naive_softmax<<<grid, block, 0, stream>>>(d_attn, d_attn, S);
+    // softmax
+    dim3 sm_grid(B * H, 1, 1);
+    dim3 sm_block(S, 1, 1);
+    naive_softmax<half><<<sm_grid, sm_block, 0, stream>>>(d_sm_ptr, d_sm_ptr, S);
     cudaStreamSynchronize(stream);
 
-    // Kernel 3: P @ V
-    naive_pv<<<grid, block, 0, stream>>>(d_attn, d_V, d_O, S, D);
+    // O = sm * V
+    dim3 o_grid(B * H, 1, 1);
+    dim3 o_block(S, 1, 1);
+    naive_pv<half><<<o_grid, o_block, 0, stream>>>(d_sm_ptr, d_V, d_O, S, D);
     cudaStreamSynchronize(stream);
 
-    // D2H
-    float* h_O_buf = nullptr;
-    cudaMallocHost((void**)&h_O_buf, qkv_bytes);
-    cudaMemcpy(h_O_buf, d_O, qkv_bytes, cudaMemcpyDeviceToHost);
+    // D2H (half -> float)
+    std::vector<half> h_O_half(num_elems);
+    cudaMemcpy(h_O_half.data(), d_O, qkv_bytes, cudaMemcpyDeviceToHost);
 
-    std::vector<float> output(h_O_buf, h_O_buf + out_elems);
+    std::vector<float> output(num_elems);
+    for (size_t i = 0; i < num_elems; i++) {
+        output[i] = __half2float(h_O_half[i]);
+    }
 
-    // Free
+    // Free (d_sm auto-freed by thrust destructor)
     cudaFree(d_Q);
     cudaFree(d_K);
     cudaFree(d_V);
     cudaFree(d_O);
-    cudaFree(d_attn);
-    cudaFreeHost(h_O_buf);
 
     return output;
 }
 
 // ============================================================================
-// CPU reference
+// CPU reference (fp32 for accuracy)
 // ============================================================================
 
 std::vector<float> naive_attention_cpu_ref(
@@ -249,14 +272,14 @@ std::vector<float> naive_attention_cpu_ref(
 }
 
 // ============================================================================
-// Verification — tolerance-based (matmul + exp accumulate float error)
+// Verification — wider tolerance for fp16 (half has ~3 decimal digits precision)
 // ============================================================================
 
 static bool close_enough(float out, float gold)
 {
     float abs_err = std::abs(out - gold);
     float rel_err = abs_err / std::max(std::abs(gold), 1e-30f);
-    return abs_err < 1e-4f || rel_err < 1e-4f;
+    return abs_err < 5e-2f || rel_err < 1e-1f;
 }
 
 uint32_t verify_result(const std::vector<float>& output,
@@ -312,7 +335,7 @@ uint32_t verify_result(const std::vector<float>& output,
 }
 
 // ============================================================================
-// Test data generation
+// Test data generation (generate in float, kernel runs in half)
 // ============================================================================
 
 static void gen_qkv(std::vector<float>& Q, std::vector<float>& K, std::vector<float>& V,
